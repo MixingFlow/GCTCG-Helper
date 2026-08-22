@@ -1,16 +1,13 @@
 // ==UserScript==
-// @name         Gamescom 2026 EPIX Card Helper
+// @name         GCTCG Helper
 // @namespace    https://github.com/MixingFlow/GCTCG-Helper
-// @version      1.0.0
-// @description  Shows duplicate and missing cards on the Gamescom EPIX Cards page.
+// @version      1.0.1
+// @description  Gamescom EPIX Trading Cards Helper
 // @author       MixingFlow
-// @match        *://*.gamescom.global/*/epix/cards*
-// @match        *://gamescom.global/*/epix/cards*
-// @match        *://*.gamescom.global/epix/cards*
-// @match        *://gamescom.global/epix/cards*
+// @match        *://*.gamescom.global/*
+// @match        *://gamescom.global/*
 // @icon         https://www.gamescom.global/static/meta/favicon.ico
 // @grant        GM_setClipboard
-// @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -22,6 +19,7 @@
   const $ = (s, c = document) => c.querySelector(s);
   const $$ = (s, c = document) => [...c.querySelectorAll(s)];
   const de = () => document.documentElement.lang === 'de' || location.pathname.startsWith('/de');
+  const isCardsPage = () => location.pathname.includes('/epix/cards');
   const log = (...a) => console.log('%c[GCTCG]', 'background:#7c3aed;color:#fff;padding:2px 5px;border-radius:3px;font-weight:bold', ...a);
 
   let DB = [], byHash = new Map(), byName = new Map(), lastSig = '', observer, timer;
@@ -84,7 +82,9 @@
   }
 
   function render() {
+    if (!isCardsPage()) { lastSig = ''; return; }
     if (!DB.length) return;
+
     const cards = $$('.card-list--list-item:not([data-gctcg-section] *)');
     if (!cards.length) return;
 
@@ -97,12 +97,13 @@
     // Scan owned cards
     const owned = new Map();
     native.forEach((el, i) => {
-      const img = $('img[src*="graphassets.com"], img.image--img, img', el);
+      if ($('.card-tile--is-locked', el)) return;
+      const img = $('img', el);
       if (!img) return;
       const alt = (img.alt || '').trim(), src = img.src || '', hash = src.split('/').pop().split('?')[0];
       const count = ($('.card-list--list-item-count', el) || el).textContent.match(/x\s*(\d+)/i);
       const db = (hash && byHash.get(hash)) || (alt && byName.get(alt.toLowerCase()));
-      owned.set(db?.id || hash || alt || i, {
+      owned.set(db?.id || hash || alt || `unknown-${i}`, {
         dbCard: db || { num: '??', id: 0, name: alt || 'Unknown', imageId: hash },
         count: count ? +count[1] : 1, el, alt, src, hash
       });
@@ -151,7 +152,6 @@
       setTimeout(() => $('.gctcg-toast')?.remove(), 2500);
     });
 
-    (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).GCTCG = { run: render, owned, dups, miss, db: DB };
     log(`${owned.size} owned, ${dups.length} dups, ${miss.length} missing`);
     observer?.observe(document.body, { childList: true, subtree: true });
   }
@@ -172,8 +172,19 @@
     .gctcg-toast { position: fixed; bottom: 24px; right: 24px; background: #0f172a; border: 1px solid #10b981; color: #fff; padding: 10px 18px; border-radius: 8px; z-index: 999999 }`;
 
   const trigger = () => { clearTimeout(timer); timer = setTimeout(render, 250); };
-  observer = new MutationObserver(m => m.some(x => x.addedNodes.length && !x.target.closest?.('[data-gctcg-section],header,nav,footer')) && trigger());
+  observer = new MutationObserver(m => m.some(x => x.addedNodes.length && !x.target.closest?.('[data-gctcg-section]')) && trigger());
   observer.observe(document.body, { childList: true, subtree: true });
+
+  // Hook Next.js SPA navigation
+  ['pushState', 'replaceState'].forEach(method => {
+    const original = history[method];
+    history[method] = function (...args) {
+      const result = original.apply(this, args);
+      trigger();
+      return result;
+    };
+  });
+  window.addEventListener('popstate', trigger);
 
   fetch(DB_URL).then(r => r.json()).then(res => {
     DB = res.map((r, i) => {
@@ -185,7 +196,4 @@
     log(`Loaded ${DB.length} cards`);
     trigger();
   }).catch(e => log('DB load failed', e));
-
-  let att = 0;
-  const iv = setInterval(() => { if ($('#gctcg-dup') || ++att > 10) clearInterval(iv); else trigger(); }, 1000);
 })();
