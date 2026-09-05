@@ -1,202 +1,428 @@
 // ==UserScript==
 // @name         GCTCG Helper
 // @namespace    https://github.com/MixingFlow/GCTCG-Helper
-// @version      1.0.1
+// @version      1.0.3
 // @description  Gamescom EPIX Trading Cards Helper
 // @author       MixingFlow
 // @match        *://*.gamescom.global/*
 // @match        *://gamescom.global/*
 // @icon         https://www.gamescom.global/static/meta/favicon.ico
-// @license      MIT
 // @grant        GM_setClipboard
-// @run-at       document-idle
-// @downloadURL https://update.greasyfork.org/scripts/592533/GCTCG%20Helper.user.js
-// @updateURL https://update.greasyfork.org/scripts/592533/GCTCG%20Helper.meta.js
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
   'use strict';
 
   const DB_URL = 'https://raw.githubusercontent.com/MixingFlow/GCTCG-Helper/main/cards/2026.json';
-  const IMG = 'https://eu-central-1-gamescom.graphassets.com/AMwDHZTUSMaIlRlMFLL7Qz/quality=value:95/resize=w:320,h:494,fit:crop/sharpen=amount:1/auto_image/';
-  const $ = (s, c = document) => c.querySelector(s);
-  const $$ = (s, c = document) => [...c.querySelectorAll(s)];
-  const de = () => document.documentElement.lang === 'de' || location.pathname.startsWith('/de');
+  const IMAGE_BASE = 'https://eu-central-1-gamescom.graphassets.com/AMwDHZTUSMaIlRlMFLL7Qz/quality=value:95/resize=w:320,h:494,fit:crop/sharpen=amount:1/auto_image/';
+  
+  const $ = (selector, context = document) => context.querySelector(selector);
+  const $$ = (selector, context = document) => [...context.querySelectorAll(selector)];
+  const isGerman = () => document.documentElement.lang === 'de' || location.pathname.startsWith('/de');
   const isCardsPage = () => location.pathname.includes('/epix/cards');
-  const log = (...a) => console.log('%c[GCTCG]', 'background:#7c3aed;color:#fff;padding:2px 5px;border-radius:3px;font-weight:bold', ...a);
+  const log = (...args) => console.log('%c[GCTCG]', 'background:#7c3aed;color:#fff;padding:2px 5px;border-radius:3px;font-weight:bold', ...args);
 
-  let DB = [], byHash = new Map(), byName = new Map(), lastSig = '', observer, timer;
+  // Global State
+  let database = [];
+  let cardsByHash = new Map();
+  let cardsByName = new Map();
+  let myUserId = '';
+  let myAuthToken = '';
+  let myOwnedCards = null;
+  let lastRenderSignature = '';
+  let uiObserver = null;
+  let renderTimer = null;
+  const tradeAds = new Map();
 
-  function placeholderSvg(num, lbl) {
-    return 'data:image/svg+xml,' + encodeURIComponent([
-      '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="494">',
-      '<defs><linearGradient id="b" x2="100%" y2="100%">',
-      '<stop stop-color="#24123a"/><stop offset="100%" stop-color="#12071f"/>',
-      '</linearGradient></defs>',
-      '<rect width="320" height="494" rx="8" fill="url(#b)"/>',
-      '<rect x="12" y="12" width="296" height="470" rx="6" fill="none" stroke="#6b21a8" stroke-width="2" stroke-dasharray="8,6"/>',
-      '<circle cx="160" cy="205" r="34" fill="#3b0764" stroke="#7e22ce" stroke-width="2"/>',
-      '<text x="160" y="217" fill="#d8b4fe" font-family="system-ui" font-size="32" font-weight="bold" text-anchor="middle">?</text>',
-      `<text x="160" y="270" fill="#faf5ff" font-family="system-ui" font-size="17" font-weight="bold" text-anchor="middle" letter-spacing="1.5">${lbl.toUpperCase()}</text>`,
-      `<text x="160" y="300" fill="#c084fc" font-family="system-ui" font-size="15" font-weight="600" text-anchor="middle">${num}</text>`,
-      '</svg>'
-    ].join(''));
+  // 1. API Interceptor
+  // We inject this to capture the auth token and intercept incoming API data
+  const interceptorScript = document.createElement('script');
+  interceptorScript.textContent = `(function() {
+    const originalFetch = window.fetch;
+    window.fetch = async function(...args) {
+      const url = (args[0] instanceof Request ? args[0].url : args[0]) || '';
+      const headers = args[0] instanceof Request ? args[0].headers : new Headers((args[1] || {}).headers);
+      const auth = headers.get('Authorization') || '';
+
+      // Capture auth token for our auto-generate requests
+      if (auth.startsWith('Bearer ') && !window.__gctcg_token) {
+        try {
+          window.__gctcg_token = auth;
+          const payload = JSON.parse(atob(auth.split('.')[1]));
+          const uid = payload.UID || payload.sub;
+          window.dispatchEvent(new CustomEvent('gctcg-user', { detail: { uid, token: auth } }));
+        } catch(e) {}
+      }
+
+      const response = await originalFetch.apply(this, args);
+
+      try {
+        if (url.includes('/trade/advertisements?cardType=')) {
+          const data = await response.clone().json();
+          if (data && data.tradeAdvertisements) {
+            const cardType = url.match(/cardType=([^&]+)/)[1];
+            window.dispatchEvent(new CustomEvent('gctcg-ads', { detail: { cardType, ads: data.tradeAdvertisements } }));
+          }
+        } else if (url.includes('/get-cards')) {
+          const data = await response.clone().json();
+          if (data && data.ownedCards) {
+            window.dispatchEvent(new CustomEvent('gctcg-inventory', { detail: data.ownedCards }));
+          }
+        }
+      } catch (e) {}
+
+      return response;
+    };
+  })()`;
+  (document.head || document.documentElement).appendChild(interceptorScript);
+  interceptorScript.remove();
+
+  // Listen to intercepted data
+  window.addEventListener('gctcg-user', e => { myUserId = e.detail.uid; myAuthToken = e.detail.token; });
+  window.addEventListener('gctcg-ads', e => tradeAds.set(e.detail.cardType, e.detail.ads));
+  window.addEventListener('gctcg-inventory', e => { myOwnedCards = e.detail; triggerRender(); });
+
+  // 2. UI Helpers
+  function createPlaceholderSvg(number, label) {
+    const encoded = encodeURIComponent(`
+      <svg xmlns="http://www.w3.org/2000/svg" width="320" height="494">
+        <defs>
+          <linearGradient id="bg" x2="100%" y2="100%">
+            <stop stop-color="#24123a"/><stop offset="100%" stop-color="#12071f"/>
+          </linearGradient>
+        </defs>
+        <rect width="320" height="494" rx="8" fill="url(#bg)"/>
+        <rect x="12" y="12" width="296" height="470" rx="6" fill="none" stroke="#6b21a8" stroke-width="2" stroke-dasharray="8,6"/>
+        <circle cx="160" cy="205" r="34" fill="#3b0764" stroke="#7e22ce" stroke-width="2"/>
+        <text x="160" y="217" fill="#d8b4fe" font-family="system-ui" font-size="32" font-weight="bold" text-anchor="middle">?</text>
+        <text x="160" y="270" fill="#faf5ff" font-family="system-ui" font-size="17" font-weight="bold" text-anchor="middle" letter-spacing="1.5">${label.toUpperCase()}</text>
+        <text x="160" y="300" fill="#c084fc" font-family="system-ui" font-size="15" font-weight="600" text-anchor="middle">${number}</text>
+      </svg>
+    `);
+    return `data:image/svg+xml,${encoded}`;
   }
 
-  function prepCard(el, src, alt, clickTarget) {
-    el.setAttribute('data-gctcg', '');
-    const img = $$('img', el);
-    if (img.length) {
-      const m = img.find(i => i.classList.contains('image--img')) || img[0];
-      ['srcset', 'sizes', 'data-nimg'].forEach(a => m.removeAttribute(a));
-      Object.assign(m.style, { filter: '', opacity: '1', visibility: 'visible', color: 'transparent' });
-      m.className = 'image--img is--loaded';
-      m.src = src;
-      m.alt = alt || '';
-      img.forEach(i => i !== m && i.remove());
+  function cloneAndPrepareCard(templateNode, imgSrc, altText, clickTargetNode) {
+    const card = templateNode.cloneNode(true);
+    card.removeAttribute('data-gctcg-miss');
+    card.setAttribute('data-gctcg', '');
+
+    // Replace the image cleanly
+    const imageContainer = $('.image', card);
+    if (imageContainer) {
+      imageContainer.innerHTML = `<img alt="${altText || ''}" loading="lazy" class="image--img is--loaded" style="opacity: 1; visibility: visible;" src="${imgSrc}">`;
     }
-    const vid = $('video', el);
-    if (vid) {
-      vid.muted = vid.playsInline = vid.loop = vid.autoplay = true;
-      setTimeout(() => vid.play().catch(() => {}), 50);
+
+    // Force video to play if it's a holo card
+    const video = $('video', card);
+    if (video) {
+      video.play().catch(() => {});
     }
-    if (clickTarget) el.onclick = e => { e.preventDefault(); e.stopPropagation(); clickTarget.click(); };
-    return el;
+
+    // Forward clicks to the real card if provided
+    if (clickTargetNode) {
+      card.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        clickTargetNode.click();
+      };
+    }
+
+    return card;
   }
 
-  function section(id, title, pillCls, badge, cards = [], extra = '') {
-    const s = document.createElement('section');
-    s.id = id;
-    s.setAttribute('data-gctcg-section', '');
-    s.innerHTML = `
+  function createSection(id, title, colorClass, badgeText, cardElements = [], extraHtml = '') {
+    const section = document.createElement('section');
+    section.id = id;
+    section.setAttribute('data-gctcg-section', '');
+    
+    section.innerHTML = `
       <div class="gctcg-hdr d-flex justify-content-between align-items-center flex-wrap gap-2">
         <h2 class="gctcg-title d-flex align-items-center gap-2">
-          ${title} <span class="gctcg-pill ${pillCls}">${badge}</span>
+          ${title} <span class="gctcg-pill ${colorClass}">${badgeText}</span>
         </h2>
-        ${extra}
-      </div>`;
-    if (cards.length) {
-      const g = document.createElement('div');
-      g.className = 'row gx-3 gy-4 g-sm-4';
-      cards.forEach(c => g.appendChild(c));
-      s.appendChild(g);
+        <div class="d-flex gap-2">${extraHtml}</div>
+      </div>
+    `;
+
+    if (cardElements.length > 0) {
+      const grid = document.createElement('div');
+      grid.className = 'row gx-3 gy-4 g-sm-4';
+      cardElements.forEach(card => grid.appendChild(card));
+      section.appendChild(grid);
     }
-    return s;
+
+    return section;
   }
 
+  // Trade list copy/generate handler (standalone, called from render's button listeners)
+  async function handleCopy(shouldAutoGenerate, duplicates, missing, isDe) {
+    const button = shouldAutoGenerate ? $('#gctcg-auto') : $('#gctcg-copy');
+    const originalText = button.textContent;
+
+    if (shouldAutoGenerate) {
+      button.textContent = isDe ? 'Generiere Links...' : 'Generating Links...';
+    }
+
+    const wantedNumbers = missing
+      .filter(m => m.imageId && !m.name.startsWith('Card '))
+      .map(m => m.num.split('-')[1]);
+
+    const haveLines = [];
+
+    for (const dup of duplicates) {
+      let textLine = `${dup.dbCard.num} - ${dup.dbCard.name}`;
+      const cardType = dup.hygraphId;
+
+      if (cardType && myUserId && myAuthToken) {
+        const allAdsForCard = tradeAds.get(cardType) || [];
+        let activeAd = allAdsForCard.find(ad => ad.userId === myUserId && ad.closedAt === null);
+
+        if (!activeAd && shouldAutoGenerate) {
+          try {
+            const response = await fetch('https://wfppjum4x2.execute-api.eu-central-1.amazonaws.com/production/trade/advertisements', {
+              method: 'POST',
+              headers: { 'Authorization': myAuthToken, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ cards: [cardType] })
+            });
+            const data = await response.json();
+
+            if (data && data.tradeAdvertisementId) {
+              activeAd = { id: data.tradeAdvertisementId, userId: myUserId, closedAt: null };
+              allAdsForCard.push(activeAd);
+              tradeAds.set(cardType, allAdsForCard);
+            }
+          } catch (error) {
+            log('Failed to auto-generate trade link for', dup.dbCard.name, error);
+          }
+        }
+
+        if (activeAd) {
+          textLine = `[${textLine}](https://www.gamescom.global/de/epix/cards?advertisementId=${activeAd.id})`;
+        }
+      }
+      haveLines.push(textLine);
+    }
+
+    button.textContent = originalText;
+
+    const haveBlock = haveLines.join('\n') || (isDe ? 'Keine' : 'None');
+    const wantBlock = wantedNumbers.join(', ') || (isDe ? 'Keine' : 'None');
+    const finalClipboardText = `__**${isDe ? 'BIETE' : 'HAVE'}**__\n\n${haveBlock}\n\n__**${isDe ? 'BRAUCHE' : 'WANT'}**__ (2026 ${isDe ? 'Karten' : 'cards'})\n\n${wantBlock}`;
+
+    if (window.GM_setClipboard) {
+      GM_setClipboard(finalClipboardText);
+    } else if (navigator.clipboard) {
+      navigator.clipboard.writeText(finalClipboardText);
+    }
+
+    document.body.insertAdjacentHTML('beforeend', `<div class="gctcg-toast">${isDe ? 'Kopiert!' : 'Copied!'}</div>`);
+    setTimeout(() => $('.gctcg-toast')?.remove(), 2500);
+  }
+
+  // 3. Core Logic
   function render() {
-    if (!isCardsPage()) { lastSig = ''; return; }
-    if (!DB.length) return;
+    if (!isCardsPage()) {
+      lastRenderSignature = '';
+      return;
+    }
+    
+    if (database.length === 0 || myOwnedCards === null) return;
 
-    const cards = $$('.card-list--list-item:not([data-gctcg-section] *)');
-    if (!cards.length) return;
+    const nativeCards = $$('.card-list--list-item:not([data-gctcg-section] *)');
+    if (nativeCards.length === 0) return;
+    
+    const cardContainer = nativeCards[0].parentElement;
 
-    const container = cards[0].parentElement;
-    const native = [...container.children].filter(e => !e.hasAttribute('data-gctcg'));
-    if (!native.length) return;
+    if (!$('#gctcg-styles')) {
+      document.head.insertAdjacentHTML('beforeend', `<style id="gctcg-styles">${STYLES}</style>`);
+    }
 
-    if (!$('#gctcg-styles')) document.head.insertAdjacentHTML('beforeend', `<style id="gctcg-styles">${CSS}</style>`);
-
-    // Scan owned cards
-    const owned = new Map();
-    native.forEach((el, i) => {
-      if ($('.card-tile--is-locked', el)) return;
-      const img = $('img', el);
-      if (!img) return;
-      const alt = (img.alt || '').trim(), src = img.src || '', hash = src.split('/').pop().split('?')[0];
-      const count = ($('.card-list--list-item-count', el) || el).textContent.match(/x\s*(\d+)/i);
-      const db = (hash && byHash.get(hash)) || (alt && byName.get(alt.toLowerCase()));
-      owned.set(db?.id || hash || alt || `unknown-${i}`, {
-        dbCard: db || { num: '??', id: 0, name: alt || 'Unknown', imageId: hash },
-        count: count ? +count[1] : 1, el, alt, src, hash
-      });
+    // Find the real elements in the DOM so we can forward clicks to them
+    const nativeElementsByHash = new Map();
+    [...cardContainer.children].forEach(element => {
+      if (element.hasAttribute('data-gctcg')) return;
+      const img = $('img', element);
+      if (img) {
+        const hash = img.src.split('/').pop().split('?')[0];
+        nativeElementsByHash.set(hash, element);
+      }
     });
 
-    const sig = [...owned].map(([k, v]) => `${k}:${v.count}`).sort().join();
-    if (!owned.size || (sig === lastSig && $('#gctcg-dup'))) return;
-    lastSig = sig;
+    // Tally up our inventory, strictly filtering to 2026 cards to prevent cross-season bugs
+    const inventory = new Map();
+    const cards2026 = myOwnedCards.filter(card => card.season === 'season_2026');
+    
+    for (const apiCard of cards2026) {
+      const hash = apiCard.mainAsset?.handle;
+      if (!hash) continue;
 
-    // Compute dups & missing
-    const dups = [], miss = DB.filter(c => !owned.has(c.id));
-    let ext = 0;
-    owned.forEach(v => { if (v.count > 1) { dups.push(v); ext += v.count - 1; } });
-    dups.sort((a, b) => (a.dbCard.id || 0) - (b.dbCard.id || 0));
+      // Find the card in our DB using the image hash.
+      // If Gamescom changed the image hash, fallback to matching by exact name.
+      const nameLower = (apiCard.name || '').toLowerCase();
+      let dbMatch = cardsByHash.get(hash) || cardsByName.get(nameLower);
+      
+      if (!dbMatch) {
+        dbMatch = { id: 0, num: '??', name: apiCard.name || 'Unknown', imageId: hash };
+      }
 
-    // Rebuild sections
-    observer?.disconnect();
-    $$('[data-gctcg-section]').forEach(e => e.remove());
-    const g = de();
+      const key = dbMatch.id || hash;
+      if (!inventory.has(key)) {
+        inventory.set(key, { 
+          dbCard: dbMatch, 
+          count: 0, 
+          hash: hash, 
+          hygraphId: apiCard.hygraphModelId 
+        });
+      }
+      inventory.get(key).count++;
+    }
 
-    const dupEls = dups.map(d => prepCard(d.el.cloneNode(true), d.hash ? IMG + d.hash : d.src, d.alt, $('[role="button"],button,a,img', d.el) || d.el));
-    const missEls = miss.map(c => {
-      const el = cards[0].cloneNode(true);
-      el.setAttribute('data-gctcg-miss', '');
-      $$('.card-tile--is-advertised, [class*="list-item-count"]', el).forEach(n => n.remove());
-      const unk = !c.imageId || c.name.startsWith('Card ');
-      const lbl = g ? 'Unveröffentlicht' : 'Unreleased';
-      el.title = `${c.num}: ${unk ? lbl : c.name}`;
-      return prepCard(el, c.imageId ? IMG + c.imageId : placeholderSvg(c.num, lbl), unk ? lbl : c.name);
+    // Abort render if inventory hasn't changed to save CPU
+    const signature = [...inventory].map(([key, item]) => `${key}:${item.count}`).sort().join();
+    if (inventory.size === 0 || (signature === lastRenderSignature && $('#gctcg-dup'))) return;
+    lastRenderSignature = signature;
+
+    // Categorize cards
+    const duplicates = [];
+    let extraDuplicatesCount = 0;
+    
+    for (const item of inventory.values()) {
+      if (item.count > 1) {
+        duplicates.push(item);
+        extraDuplicatesCount += (item.count - 1);
+      }
+    }
+    duplicates.sort((a, b) => database.indexOf(a.dbCard) - database.indexOf(b.dbCard));
+
+    const missing = database.filter(dbCard => !inventory.has(dbCard.id));
+
+    // Clear old sections and pause DOM observer temporarily
+    if (uiObserver) uiObserver.disconnect();
+    $$('[data-gctcg-section]').forEach(element => element.remove());
+
+    const isDe = isGerman();
+    const templateNode = nativeCards[0].cloneNode(true);
+    $$('.card-tile--is-advertised, [class*="list-item-count"]', templateNode).forEach(n => n.remove());
+
+    // Build Duplicate Card Elements
+    const duplicateElements = duplicates.map(dup => {
+      const targetElement = nativeElementsByHash.get(dup.hash);
+      const clickTarget = targetElement ? ($('[role="button"],button,a,img', targetElement) || targetElement) : null;
+      
+      const card = cloneAndPrepareCard(templateNode, dup.hash ? (IMAGE_BASE + dup.hash) : '', dup.dbCard.name, clickTarget);
+      
+      const countLabel = document.createElement('div');
+      countLabel.className = 'card-list--list-item-count d-flex mt-1 justify-content-end';
+      countLabel.textContent = `x${dup.count}`;
+      card.appendChild(countLabel);
+      
+      return card;
     });
 
-    const copyBtn = `<button id="gctcg-copy" class="gctcg-copy">${g ? 'Tauschliste kopieren' : 'Copy Trade List'}</button>`;
-    container.before(
-      section('gctcg-dup', g ? 'Doppelte Karten' : 'Duplicate Cards', 'gctcg-pill-g', `${dups.length} (+${ext})`, dupEls, copyBtn),
-      section('gctcg-miss', g ? 'Fehlende Karten' : 'Missing Cards', 'gctcg-pill-r', `${miss.length}/${DB.length}`, missEls),
-      section('gctcg-own', g ? 'Alle Karten' : 'All Cards', 'gctcg-pill-p', `${owned.size}`)
+    // Build Missing Card Elements
+    const missingElements = missing.map(missCard => {
+      const isUnrevealed = !missCard.imageId || missCard.name.startsWith('Card ');
+      const unrevealedLabel = isDe ? 'Unveröffentlicht' : 'Unreleased';
+      const label = isUnrevealed ? unrevealedLabel : missCard.name;
+      const imgSrc = missCard.imageId ? (IMAGE_BASE + missCard.imageId) : createPlaceholderSvg(missCard.num, unrevealedLabel);
+
+      const card = cloneAndPrepareCard(templateNode, imgSrc, label, null);
+      card.setAttribute('data-gctcg-miss', '');
+      card.title = `${missCard.num}: ${label}`;
+      return card;
+    });
+
+    // Append to DOM
+    const copyButton = `<button id="gctcg-copy" class="gctcg-btn">${isDe ? 'Tauschliste kopieren' : 'Copy Trade List'}</button>`;
+    const autoButton = `<button id="gctcg-auto" class="gctcg-btn gctcg-btn-auto">${isDe ? 'Links generieren & kopieren' : 'Auto-Generate Links & Copy'}</button>`;
+    
+    cardContainer.before(
+      createSection('gctcg-dup', isDe ? 'Doppelte Karten' : 'Duplicate Cards', 'gctcg-pill-green', `${duplicates.length} (+${extraDuplicatesCount})`, duplicateElements, copyButton + autoButton),
+      createSection('gctcg-miss', isDe ? 'Fehlende Karten' : 'Missing Cards', 'gctcg-pill-red', `${missing.length}/${database.length}`, missingElements),
+      createSection('gctcg-own', isDe ? 'Alle Karten' : 'All Cards', 'gctcg-pill-purple', `${inventory.size}`)
     );
 
-    // Copy handler
-    $('#gctcg-copy')?.addEventListener('click', () => {
-      const want = miss.filter(m => m.imageId && !m.name.startsWith('Card ')).map(m => m.num.split('-')[1]);
-      const have = dups.map(d => `${d.dbCard.num} - ${d.dbCard.name}`).join('\n') || (g ? 'Keine' : 'None');
-      const t = `__**${g ? 'BIETE' : 'HAVE'}**__\n\n${have}\n\n__**${g ? 'BRAUCHE' : 'WANT'}**__ (2026 ${g ? 'Karten' : 'cards'})\n\n${want.join(', ') || (g ? 'Keine' : 'None')}`;
-      if (window.GM_setClipboard) GM_setClipboard(t); else navigator.clipboard?.writeText(t);
-      document.body.insertAdjacentHTML('beforeend', `<div class="gctcg-toast">${g ? 'Kopiert!' : 'Copied!'}</div>`);
-      setTimeout(() => $('.gctcg-toast')?.remove(), 2500);
-    });
+    $('#gctcg-copy')?.addEventListener('click', () => handleCopy(false, duplicates, missing, isDe));
+    $('#gctcg-auto')?.addEventListener('click', () => handleCopy(true, duplicates, missing, isDe));
 
-    log(`${owned.size} owned, ${dups.length} dups, ${miss.length} missing`);
-    observer?.observe(document.body, { childList: true, subtree: true });
+    log(`Render complete: ${inventory.size} owned, ${duplicates.length} duplicates, ${missing.length} missing`);
+    
+    // Resume observing
+    if (uiObserver) uiObserver.observe(document.body, { childList: true, subtree: true });
   }
 
-  const CSS = `
-    [data-gctcg-section] { margin: 2rem 0 }
-    .gctcg-hdr { border-bottom: 2px solid rgba(255,255,255,.15); padding-bottom: .75rem; margin-bottom: 1.25rem }
-    .gctcg-title { font-size: 1.5rem; font-weight: 700; color: #fff; margin: 0 }
-    .gctcg-pill { font-size: .8rem; font-weight: 600; padding: .2rem .65rem; border-radius: 999px; border: 1px solid }
-    .gctcg-pill-g { background: rgba(16,185,129,.2); border-color: rgba(16,185,129,.4); color: #34d399 }
-    .gctcg-pill-r { background: rgba(239,68,68,.2); border-color: rgba(239,68,68,.4); color: #f87171 }
-    .gctcg-pill-p { background: rgba(168,85,247,.2); border-color: rgba(168,85,247,.4); color: #c084fc }
-    [data-gctcg-miss] img { filter: grayscale(1) brightness(.85) contrast(1.05) !important; opacity: 1 !important; transition: filter .25s }
-    [data-gctcg-miss]:hover img { filter: grayscale(.25) brightness(.98) !important }
-    [data-gctcg-miss] video { filter: grayscale(1) brightness(.8) !important; opacity: 1 !important; transition: filter .25s }
-    [data-gctcg-miss]:hover video { filter: none !important }
-    .gctcg-copy { cursor: pointer; font-size: .85rem; font-weight: 600; padding: .35rem .8rem; border-radius: 6px; background: #7c3aed; border: 1px solid #8b5cf6; color: #fff }
-    .gctcg-toast { position: fixed; bottom: 24px; right: 24px; background: #0f172a; border: 1px solid #10b981; color: #fff; padding: 10px 18px; border-radius: 8px; z-index: 999999 }`;
+  const STYLES = `
+    [data-gctcg-section] { margin: 2.5rem 0; }
+    .gctcg-hdr { border-bottom: 2px solid rgba(255, 255, 255, 0.15); padding-bottom: 0.75rem; margin-bottom: 1.25rem; }
+    .gctcg-title { font-size: 1.5rem; font-weight: 700; color: #fff; margin: 0; }
+    .gctcg-pill { font-size: 0.8rem; font-weight: 600; padding: 0.2rem 0.65rem; border-radius: 999px; border: 1px solid; }
+    .gctcg-pill-green { background: rgba(16, 185, 129, 0.2); border-color: rgba(16, 185, 129, 0.4); color: #34d399; }
+    .gctcg-pill-red { background: rgba(239, 68, 68, 0.2); border-color: rgba(239, 68, 68, 0.4); color: #f87171; }
+    .gctcg-pill-purple { background: rgba(168, 85, 247, 0.2); border-color: rgba(168, 85, 247, 0.4); color: #c084fc; }
+    .gctcg-btn { cursor: pointer; font-size: 0.85rem; font-weight: 600; padding: 0.4rem 0.85rem; border-radius: 6px; background: #7c3aed; border: 1px solid #8b5cf6; color: #fff; transition: opacity 0.2s; }
+    .gctcg-btn:hover { opacity: 0.9; }
+    .gctcg-btn-auto { background: #10b981; border-color: #059669; }
+    .gctcg-toast { position: fixed; bottom: 24px; right: 24px; background: #0f172a; border: 1px solid #10b981; color: #fff; padding: 10px 18px; border-radius: 8px; z-index: 999999; }
+    [data-gctcg-miss] img { filter: grayscale(1) brightness(0.85) contrast(1.05) !important; opacity: 1 !important; transition: filter 0.25s; }
+    [data-gctcg-miss]:hover img { filter: grayscale(0.25) brightness(0.98) !important; }
+    [data-gctcg-miss] video { filter: grayscale(1) brightness(0.8) !important; opacity: 1 !important; transition: filter 0.25s; }
+    [data-gctcg-miss]:hover video { filter: none !important; }
+  `;
 
-  const trigger = () => { clearTimeout(timer); timer = setTimeout(render, 250); };
-  observer = new MutationObserver(m => m.some(x => x.addedNodes.length && !x.target.closest?.('[data-gctcg-section]')) && trigger());
-  observer.observe(document.body, { childList: true, subtree: true });
+  // 4. Initialization
+  const triggerRender = () => {
+    clearTimeout(renderTimer);
+    renderTimer = setTimeout(render, 250);
+  };
 
-  // Hook Next.js SPA navigation
-  ['pushState', 'replaceState'].forEach(method => {
-    const original = history[method];
-    history[method] = function (...args) {
-      const result = original.apply(this, args);
-      trigger();
+  const setupObserver = () => {
+    if (uiObserver) return;
+    uiObserver = new MutationObserver(mutations => {
+      const isRelevantChange = mutations.some(m => m.addedNodes.length > 0 && !m.target.closest?.('[data-gctcg-section]'));
+      if (isRelevantChange) triggerRender();
+    });
+    uiObserver.observe(document.body, { childList: true, subtree: true });
+    triggerRender();
+  };
+
+  // Hook SPA navigation so we re-render when changing pages
+  ['pushState', 'replaceState'].forEach(methodName => {
+    const originalMethod = history[methodName];
+    history[methodName] = function (...args) {
+      const result = originalMethod.apply(this, args);
+      triggerRender();
       return result;
     };
   });
-  window.addEventListener('popstate', trigger);
+  window.addEventListener('popstate', triggerRender);
 
-  fetch(DB_URL).then(r => r.json()).then(res => {
-    DB = res.map((r, i) => {
-      const [id, name, hash] = Array.isArray(r) ? r : [r.id, r.name, r.imageId];
-      const num = `26-${String(id || i + 1).padStart(2, '0')}`;
-      return { id: id || i + 1, name: name || `Card ${num}`, imageId: hash || '', num };
-    });
-    DB.forEach(c => { if (c.imageId) byHash.set(c.imageId, c); if (c.name) byName.set(c.name.toLowerCase(), c); });
-    log(`Loaded ${DB.length} cards`);
-    trigger();
-  }).catch(e => log('DB load failed', e));
+  // Load the database
+  fetch(DB_URL)
+    .then(r => r.json())
+    .then(data => {
+      database = data.map((entry, index) => {
+        const [id, name, hash] = Array.isArray(entry) ? entry : [entry.id, entry.name, entry.imageId];
+        const computedId = id !== undefined ? id : (index + 1);
+        const num = String(computedId).startsWith('26-')
+          ? computedId
+          : (String(computedId) === '1'
+              ? '26-1'
+              : `26-${String(computedId).padStart(2, '0')}`);
+        return { id: computedId, name: name || `Card ${num}`, imageId: hash || '', num };
+      });
+      
+      database.forEach(card => {
+        if (card.imageId) cardsByHash.set(card.imageId, card);
+        if (card.name) cardsByName.set(card.name.toLowerCase(), card);
+      });
+      
+      log(`Loaded ${database.length} cards`);
+      
+      if (document.body) setupObserver();
+      else window.addEventListener('DOMContentLoaded', setupObserver);
+    })
+    .catch(error => log('Failed to load database', error));
+
 })();
